@@ -189,6 +189,59 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
     return x;
 }
 
+/* Re-insert an existing node in the skiplist, without choosing a new random level
+ */
+void zslReInsertNode(zskiplist *zsl, zskiplistNode *z, int level) {
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+    unsigned long rank[ZSKIPLIST_MAXLEVEL];
+    int i;
+
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
+        /* store rank that is crossed to reach the insert position */
+        rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
+        while (x->level[i].forward &&
+                (x->level[i].forward->score < z->score ||
+                    (x->level[i].forward->score == z->score &&
+                    sdscmp(x->level[i].forward->ele,z->ele) < 0)))
+        {
+            rank[i] += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        update[i] = x;
+    }
+    /* even though we are re-inserting an existing node, zslDeleteNode might have
+     * modified zsl-level when we removed it */
+    if (level > zsl->level) {
+        for (i = zsl->level; i < level; i++) {
+            rank[i] = 0;
+            update[i] = zsl->header;
+            update[i]->level[i].span = zsl->length;
+        }
+        zsl->level = level;
+    }
+    for (i = 0; i < level; i++) {
+        z->level[i].forward = update[i]->level[i].forward;
+        update[i]->level[i].forward = z;
+
+        /* update span covered by update[i] as z is inserted here */
+        z->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+    }
+
+    /* increment span for untouched levels */
+    for (i = level; i < zsl->level; i++) {
+        update[i]->level[i].span++;
+    }
+
+    z->backward = (update[0] == zsl->header) ? NULL : update[0];
+    if (z->level[0].forward)
+        z->level[0].forward->backward = z;
+    else
+        zsl->tail = z;
+    zsl->length++;
+}
+
 /* Internal function used by zslDelete, zslDeleteRangeByScore and
  * zslDeleteRangeByRank. */
 void zslDeleteNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update) {
@@ -292,15 +345,16 @@ zskiplistNode *zslUpdateScore(zskiplist *zsl, double curscore, sds ele, double n
         return x;
     }
 
-    /* No way to reuse the old node: we need to remove and insert a new
-     * one at a different place. */
+    /* We need to remove and re-insert at a different place.
+     * Figure out the level of the existing node from update */
+    i = zsl->level-1;
+    while (i >= 0 && update[i]->level[i].forward != x) {
+        i--;
+    }
+    x->score = newscore;
     zslDeleteNode(zsl, x, update);
-    zskiplistNode *newnode = zslInsert(zsl,newscore,x->ele);
-    /* We reused the old node x->ele SDS string, free the node now
-     * since zslInsert created a new one. */
-    x->ele = NULL;
-    zslFreeNode(x);
-    return newnode;
+    zslReInsertNode(zsl, x, i + 1);
+    return x;
 }
 
 int zslValueGteMin(double value, zrangespec *spec) {
